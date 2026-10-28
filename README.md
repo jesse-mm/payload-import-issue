@@ -1,67 +1,158 @@
-# Payload Blank Template
+# Reproduction: synchronous imports leak a Postgres transaction
 
-This template comes configured with the bare minimum to get started on anything you need.
+Minimal reproduction for `@payloadcms/plugin-import-export` with `import: { disableJobsQueue: true }`
+on `@payloadcms/db-postgres`, based on `create-payload-app -t blank` (Payload 3.92.1).
 
-## Quick start
+Every synchronous import leaves its own create transaction open: it is never committed or rolled back.
+The pooled connection stays `idle in transaction`, and the `imports` document is never stored, although
+the imported documents themselves are. After as many imports as the pool has connections (10 by
+default), every request (including login) waits for a connection and the app stops responding until
+the process restarts. Postgres does not end these sessions by default
+(`idle_in_transaction_session_timeout` is off), and terminating them on the database side does not
+return the clients to the Node pool.
 
-This template can be deployed directly from our Cloud hosting and it will setup MongoDB and cloud S3 object storage for media.
+## What is in this repository
 
-## Quick Start - local setup
+| File | Purpose |
+| --- | --- |
+| `src/collections/Authors.ts`, `src/collections/Posts.ts` | Posts have a relationship to authors. |
+| `src/payload.config.ts` | `importExportPlugin({ collections: [{ slug: 'posts', import: { disableJobsQueue: true } }] })` |
+| `tests/int/import-transaction.int.spec.ts` | Imports a post through the Local API and checks for open transactions and the stored import document. |
+| `src/importTransactionWorkaround.ts` | Opt-in workaround, enabled with `APPLY_WORKAROUND=true`. |
+| `docker-compose.yml` | Postgres 17 on port 5433. |
 
-To spin up this template locally, follow these steps:
+## Steps to reproduce
 
-### Clone
+```sh
+cp .env.example .env            # set any PAYLOAD_SECRET
+docker compose up -d            # Postgres on port 5433
+pnpm install
+pnpm test:int
+```
 
-After you click the `Deploy` button above, you'll want to have standalone copy of this repo on your machine. If you've already cloned this repo, skip to [Development](#development).
+Expected: all tests pass.
 
-### Development
+Actual on 3.92.1:
 
-1. First [clone the repo](#clone) if you have not done so already
-2. `cd my-project && cp .env.example .env` to copy the example environment variables. You'll need to add the `MONGODB_URL` from your Cloud project to your `.env` if you want to use S3 storage and the MongoDB database that was created for you.
+```
+✓ imports the post
+× commits the import transaction instead of leaving it open   (expected 2 to be 1)
+× stores the import document                                  (expected +0 to be 1)
+```
 
-3. `pnpm install && pnpm dev` to install dependencies and start the dev server
-4. open `http://localhost:3000` to open the app in your browser
+- `imports the post` passes: the post itself is imported.
+- `commits the import transaction instead of leaving it open` fails: after each import there is one more
+  open adapter session (`payload.db.sessions`) and one more `idle in transaction` connection.
+- `stores the import document` fails: the `imports` document does not exist after the import.
 
-That's it! Changes made in `./src` will be reflected in your app. Follow the on-screen instructions to login and create your first admin user. Then check out [Production](#production) once you're ready to build and serve your app, and [Deployment](#deployment) when you're ready to go live.
+### Through the REST API
 
-#### Docker (Optional)
+```sh
+pnpm dev
+```
 
-If you prefer to use Docker for local development instead of a local MongoDB instance, the provided docker-compose.yml file can be used.
+Create a user in the admin, add an author, and save a file `posts.json`:
 
-To do so, follow these steps:
+```json
+[{ "title": "Imported post", "author": 1 }]
+```
 
-- Modify the `MONGODB_URL` in your `.env` file to `mongodb://127.0.0.1/<dbname>`
-- Modify the `docker-compose.yml` file's `MONGODB_URL` to match the above `<dbname>`
-- Run `docker-compose up` to start the database, optionally pass `-d` to run in the background.
+Then import it a few times with a token from `POST /api/users/login`:
 
-## How it works
+```sh
+curl -X POST http://localhost:3000/api/imports \
+  -H "Authorization: JWT <token>" \
+  -F '_payload={"collectionSlug":"posts","importMode":"create"}' \
+  -F 'file=@posts.json;type=application/json'
+```
 
-The Payload config is tailored specifically to the needs of most websites. It is pre-configured in the following ways:
+And watch the open transactions:
 
-### Collections
+```sh
+docker compose exec postgres psql -U postgres -d payload_import_issue -c \
+  "select count(*) from pg_stat_activity where datname = current_database() and state = 'idle in transaction'"
+```
 
-See the [Collections](https://payloadcms.com/docs/configuration/collections) docs for details on how to extend this functionality.
+Observed on 3.92.1: each import returns `201` and creates the post, but adds one `idle in transaction`
+connection, and `select count(*) from imports` does not change. After 8 imports the 9th import hangs,
+and from then on every request that needs the database (for example `POST /api/users/login`) hangs too.
 
-- #### Users (Authentication)
+## Cause
 
-  Users are auth-enabled collections that have access to the admin panel.
+`processImportBatch` (`packages/plugin-import-export/src/import/batchProcessor.ts`) isolates
+`transactionID` on the request copy it uses for each document, but the copy still shares the parent
+request's `payloadDataLoader`. When a document with a relationship is populated, the DataLoader batch
+function (`packages/payload/src/collections/dataloader.ts`) sets `req.transactionID` on the request it
+was created with, which is the parent import request. The parent's transaction ID is overwritten (and
+later cleared), so `createOperation` never commits the transaction it opened for the `imports` document.
 
-  For additional help, see the official [Auth Example](https://github.com/payloadcms/payload/tree/3.x/examples/auth) or the [Authentication](https://payloadcms.com/docs/authentication/overview#authentication-overview) docs.
+Isolating `payloadDataLoader` as well fixes it. That change already exists on `main` (as part of #17247)
+but not on `3.x`:
 
-- #### Media
+```ts
+const req = isolateObjectProperty(reqFromArgs, ['payloadDataLoader', 'transactionID'])
+req.transactionID = undefined
+req.payloadDataLoader = getDataLoader(req)
+```
 
-  This is the uploads enabled collection. It features pre-configured sizes, focal point and manual resizing to help you manage your pictures.
+With this change applied to `batchProcessor.js` in `node_modules`, all tests in this repository pass.
 
-### Docker
+## Workaround
 
-Alternatively, you can use [Docker](https://www.docker.com) to spin up this template locally. To do so, follow these steps:
+Until the fix is released for v3, the plugin's import hooks can run with a DataLoader bound to an
+isolated request, through the plugin's `overrideImportCollection` option
+([`src/importTransactionWorkaround.ts`](src/importTransactionWorkaround.ts)):
 
-1. Follow [steps 1 and 2 from above](#development), the docker-compose file will automatically use the `.env` file in your project root
-1. Next run `docker-compose up`
-1. Follow [steps 4 and 5 from above](#development) to login and create your first admin user
+```ts
+import { getDataLoader, isolateObjectProperty } from 'payload'
+import type { CollectionAfterChangeHook, CollectionConfig } from 'payload'
 
-That's it! The Docker instance will help you get up and running quickly while also standardizing the development environment across your teams.
+const withIsolatedImportTransaction =
+  (hook: CollectionAfterChangeHook): CollectionAfterChangeHook =>
+  async (args) => {
+    const { req } = args
+    const dataLoader = req.payloadDataLoader
+    req.payloadDataLoader = getDataLoader(isolateObjectProperty(req, 'transactionID'))
 
-## Questions
+    try {
+      return await hook(args)
+    } finally {
+      req.payloadDataLoader = dataLoader
+    }
+  }
 
-If you have any issues or questions, reach out to us on [Discord](https://discord.com/invite/payload) or start a [GitHub discussion](https://github.com/payloadcms/payload/discussions).
+export const overrideImportCollection = ({ collection }: { collection: CollectionConfig }) => ({
+  ...collection,
+  hooks: {
+    ...collection.hooks,
+    afterChange: (collection.hooks?.afterChange ?? []).map(withIsolatedImportTransaction),
+  },
+})
+```
+
+```ts
+importExportPlugin({
+  collections: [{ slug: 'posts', import: { disableJobsQueue: true } }],
+  overrideImportCollection,
+})
+```
+
+Already leaked connections are not released by the workaround; restart the process once after
+deploying it.
+
+## Verification
+
+Run the tests with and without the workaround on a fresh database:
+
+```sh
+docker compose down -v && docker compose up -d
+pnpm test:int                          # 2 failed | 2 passed
+
+docker compose down -v && docker compose up -d
+APPLY_WORKAROUND=true pnpm test:int    # 4 passed
+```
+
+Through the REST API, start the app with `APPLY_WORKAROUND=true pnpm dev` and repeat the import steps
+above. Results observed with the workaround: 12 imports in a row all returned `201`, the
+`idle in transaction` count stayed at 0, every import document was stored with status `completed`,
+and login still answered in under 100 ms.

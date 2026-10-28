@@ -18,7 +18,9 @@
     "test:int": "cross-env NODE_OPTIONS=--no-deprecation vitest run --config ./vitest.config.mts"
   },
   "dependencies": {
+    "@payloadcms/db-postgres": "3.92.1",
     "@payloadcms/next": "3.92.1",
+    "@payloadcms/plugin-import-export": "3.92.1",
     "@payloadcms/richtext-lexical": "3.92.1",
     "@payloadcms/ui": "3.92.1",
     "cross-env": "^7.0.3",
@@ -28,8 +30,7 @@
     "payload": "3.92.1",
     "react": "19.2.6",
     "react-dom": "19.2.6",
-    "sharp": "0.35.4",
-    "@payloadcms/db-postgres": "3.92.1"
+    "sharp": "0.35.4"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",

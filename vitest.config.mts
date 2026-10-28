@@ -8,5 +8,7 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: ['./vitest.setup.ts'],
     include: ['tests/int/**/*.int.spec.ts'],
+    // Both test files push the dev schema on startup; running them in parallel races on a fresh DB.
+    fileParallelism: false,
   },
 })

@@ -48,3 +48,10 @@ node_modules/
 /playwright-report/
 /blob-report/
 /playwright/.cache/
+
+# reproduction runtime files
+/imports
+/media
+# written by next dev
+AGENTS.md
+CLAUDE.md
